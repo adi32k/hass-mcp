@@ -2,7 +2,21 @@ import functools
 import logging
 import json
 import httpx
-from typing import List, Dict, Any, Optional, Callable, Awaitable, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Awaitable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
+
+from pydantic import BaseModel, ConfigDict, Field, RootModel, model_validator
 
 # Set up logging
 logging.basicConfig(
@@ -30,6 +44,219 @@ from mcp.server.stdio import stdio_server
 import mcp.types as types
 mcp = FastMCP("Hass-MCP")
 
+
+def _extract_error_message(response: Any) -> Optional[str]:
+    """Extract an error message from common Home Assistant responses."""
+
+    if response is None:
+        return None
+
+    if isinstance(response, str):
+        lower = response.lower()
+        if "error" in lower:
+            return response
+        return None
+
+    if isinstance(response, dict):
+        if "error" in response and isinstance(response["error"], str):
+            return response["error"]
+        return None
+
+    if isinstance(response, list) and response:
+        first = response[0]
+        if isinstance(first, dict) and "error" in first:
+            error_val = first["error"]
+            if isinstance(error_val, str):
+                return error_val
+    return None
+
+
+class HassEntityModel(BaseModel):
+    """Standard representation of a Home Assistant entity."""
+
+    entity_id: str
+    state: Any | None = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+    domain: Optional[str] = None
+    friendly_name: Optional[str] = None
+    last_changed: Optional[str] = None
+    last_updated: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_fields(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            data = value.copy()
+            entity_id = data.get("entity_id")
+            if entity_id and "domain" not in data:
+                data["domain"] = entity_id.split(".")[0]
+
+            attributes = data.get("attributes")
+            if isinstance(attributes, dict):
+                friendly_name = attributes.get("friendly_name")
+                if friendly_name and not data.get("friendly_name"):
+                    data["friendly_name"] = friendly_name
+            return data
+        return value
+
+
+class HassEntityList(RootModel[List[HassEntityModel]]):
+    """Root model wrapper for lists of Home Assistant entities."""
+
+
+def _to_entity_list(entities: Sequence[Dict[str, Any]]) -> HassEntityList:
+    return HassEntityList(
+        root=[HassEntityModel.model_validate(entity) for entity in entities]
+    )
+
+
+class ToolResponse(BaseModel):
+    """Base response model for MCP tools exposed via FastAPI."""
+
+    success: bool = True
+    error: Optional[str] = None
+    message: Optional[str] = None
+
+
+class VersionResponse(ToolResponse):
+    result: str = ""
+
+
+class EntityResponse(ToolResponse):
+    result: Optional[HassEntityModel] = None
+
+
+class ListEntitiesResponse(ToolResponse):
+    result: HassEntityList = Field(default_factory=lambda: HassEntityList(root=[]))
+    count: int = 0
+    domain: Optional[str] = None
+    query: Optional[str] = None
+    limit: int = 100
+    fields: Optional[List[str]] = None
+    detailed: bool = False
+
+
+class SearchEntitiesResponse(ToolResponse):
+    result: HassEntityList = Field(default_factory=lambda: HassEntityList(root=[]))
+    count: int = 0
+    limit: int = 20
+    query: str = ""
+    domains: Dict[str, int] = Field(default_factory=dict)
+
+
+class DomainStateExample(BaseModel):
+    entity_id: str
+    friendly_name: Optional[str] = None
+
+
+class AttributeFrequency(BaseModel):
+    name: str
+    count: int
+
+
+class DomainSummaryData(BaseModel):
+    domain: str
+    total_count: int
+    state_distribution: Dict[str, int] = Field(default_factory=dict)
+    examples: Dict[str, List[DomainStateExample]] = Field(default_factory=dict)
+    common_attributes: List[AttributeFrequency] = Field(default_factory=list)
+
+
+class DomainSummaryResponse(ToolResponse):
+    result: Optional[DomainSummaryData] = None
+
+
+class DomainOverviewInfo(BaseModel):
+    count: int
+    states: Dict[str, int] = Field(default_factory=dict)
+
+
+class DomainSample(BaseModel):
+    entity_id: str
+    state: Optional[Any] = None
+    friendly_name: Optional[str] = None
+
+
+class DomainCount(BaseModel):
+    domain: str
+    count: int
+
+
+class SystemOverviewData(BaseModel):
+    total_entities: int
+    domain_count: Optional[int] = None
+    domains: Dict[str, DomainOverviewInfo] = Field(default_factory=dict)
+    domain_samples: Dict[str, List[DomainSample]] = Field(default_factory=dict)
+    domain_attributes: Dict[str, List[str]] = Field(default_factory=dict)
+    area_distribution: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    most_common_domains: List[DomainCount] = Field(default_factory=list)
+
+
+class SystemOverviewResponse(ToolResponse):
+    result: Optional[SystemOverviewData] = None
+
+
+class AutomationModel(BaseModel):
+    id: str
+    entity_id: str
+    state: Optional[str] = None
+    alias: Optional[str] = None
+    last_triggered: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class AutomationsResponse(ToolResponse):
+    result: List[AutomationModel] = Field(default_factory=list)
+    count: int = 0
+
+
+ServiceCallResult = Union[Dict[str, Any], List[Dict[str, Any]], None]
+
+
+class ServiceCallResponse(ToolResponse):
+    result: ServiceCallResult = None
+    domain: Optional[str] = None
+    service: Optional[str] = None
+    entity_id: Optional[str] = None
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StateChangeModel(BaseModel):
+    entity_id: str
+    state: Any | None = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+    last_changed: Optional[str] = None
+    last_updated: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class HistoryResponse(ToolResponse):
+    result: List[StateChangeModel] = Field(default_factory=list)
+    entity_id: str
+    count: int = 0
+    first_changed: Optional[str] = None
+    last_changed: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ErrorLogData(BaseModel):
+    log_text: str = ""
+    error_count: int = 0
+    warning_count: int = 0
+    integration_mentions: Dict[str, int] = Field(default_factory=dict)
+    details: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ErrorLogResponse(ToolResponse):
+    result: ErrorLogData = Field(default_factory=ErrorLogData)
+
 def async_handler(command_type: str):
     """
     Simple decorator that logs the command
@@ -47,7 +274,7 @@ def async_handler(command_type: str):
 
 @mcp.tool()
 @async_handler("get_version")
-async def get_version() -> str:
+async def get_version() -> VersionResponse:
     """
     Get the Home Assistant version
     
@@ -55,11 +282,21 @@ async def get_version() -> str:
         A string with the Home Assistant version (e.g., "2025.3.0")
     """
     logger.info("Getting Home Assistant version")
-    return await get_hass_version()
+    version = await get_hass_version()
+    error = _extract_error_message(version)
+
+    if error:
+        return VersionResponse(result="", success=False, error=error)
+
+    return VersionResponse(result=str(version))
 
 @mcp.tool()
 @async_handler("get_entity")
-async def get_entity(entity_id: str, fields: Optional[List[str]] = None, detailed: bool = False) -> dict:
+async def get_entity(
+    entity_id: str,
+    fields: Optional[List[str]] = None,
+    detailed: bool = False,
+) -> EntityResponse:
     """
     Get the state of a Home Assistant entity with optional field filtering
     
@@ -75,18 +312,25 @@ async def get_entity(entity_id: str, fields: Optional[List[str]] = None, detaile
     """
     logger.info(f"Getting entity state: {entity_id}")
     if detailed:
-        # Return all fields
-        return await get_entity_state(entity_id, lean=False)
+        entity = await get_entity_state(entity_id, lean=False)
     elif fields:
-        # Return only the specified fields
-        return await get_entity_state(entity_id, fields=fields)
+        entity = await get_entity_state(entity_id, fields=fields)
     else:
-        # Return lean format with essential fields
-        return await get_entity_state(entity_id, lean=True)
+        entity = await get_entity_state(entity_id, lean=True)
+
+    error = _extract_error_message(entity)
+    if error:
+        return EntityResponse(success=False, error=error, result=None)
+
+    return EntityResponse(result=HassEntityModel.model_validate(entity))
 
 @mcp.tool()
 @async_handler("entity_action")
-async def entity_action(entity_id: str, action: str, params: Optional[Dict[str, Any]] = None) -> dict:
+async def entity_action(
+    entity_id: str,
+    action: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> ServiceCallResponse:
     """
     Perform an action on a Home Assistant entity (on, off, toggle)
     
@@ -110,7 +354,14 @@ async def entity_action(entity_id: str, action: str, params: Optional[Dict[str, 
         - Media players: source, volume_level (0-1)
     """
     if action not in ["on", "off", "toggle"]:
-        return {"error": f"Invalid action: {action}. Valid actions are 'on', 'off', 'toggle'"}
+        return ServiceCallResponse(
+            success=False,
+            error=f"Invalid action: {action}. Valid actions are 'on', 'off', 'toggle'",
+            domain=entity_id.split(".")[0] if "." in entity_id else None,
+            service=action,
+            entity_id=entity_id,
+            data=params or {},
+        )
     
     # Map action to service name
     service = action if action == "toggle" else f"turn_{action}"
@@ -122,7 +373,18 @@ async def entity_action(entity_id: str, action: str, params: Optional[Dict[str, 
     data = {"entity_id": entity_id, **(params or {})}
     
     logger.info(f"Performing action '{action}' on entity: {entity_id} with params: {params}")
-    return await call_service(domain, service, data)
+    result = await call_service(domain, service, data)
+    error = _extract_error_message(result)
+
+    return ServiceCallResponse(
+        result=result if not error else None,
+        success=error is None,
+        error=error,
+        domain=domain,
+        service=service,
+        entity_id=entity_id,
+        data=data,
+    )
 
 @mcp.resource("hass://entities/{entity_id}")
 @async_handler("get_entity_resource")
@@ -229,12 +491,12 @@ async def get_entity_resource(entity_id: str) -> str:
 @mcp.tool()
 @async_handler("list_entities")
 async def list_entities(
-    domain: Optional[str] = None, 
-    search_query: Optional[str] = None, 
+    domain: Optional[str] = None,
+    search_query: Optional[str] = None,
     limit: int = 100,
     fields: Optional[List[str]] = None,
     detailed: bool = False
-) -> List[Dict[str, Any]]:
+) -> ListEntitiesResponse:
     """
     Get a list of Home Assistant entities with optional filtering
     
@@ -279,17 +541,43 @@ async def list_entities(
     logger.info(log_message)
     
     # Handle special case where search_query is a wildcard/asterisk - just ignore it
+    applied_query = search_query
     if search_query == "*":
         search_query = None
         logger.info("Converting '*' search query to None (retrieving all entities)")
     
     # Use the updated get_entities function with field filtering
-    return await get_entities(
-        domain=domain, 
-        search_query=search_query, 
+    entities = await get_entities(
+        domain=domain,
+        search_query=search_query,
         limit=limit,
         fields=fields,
         lean=not detailed  # Use lean format unless detailed is requested
+    )
+
+    error = _extract_error_message(entities)
+    if error:
+        return ListEntitiesResponse(
+            success=False,
+            error=error,
+            result=HassEntityList(root=[]),
+            count=0,
+            domain=domain,
+            query=applied_query,
+            limit=limit,
+            fields=fields,
+            detailed=detailed,
+        )
+
+    entity_list = _to_entity_list(entities)
+    return ListEntitiesResponse(
+        result=entity_list,
+        count=len(entity_list.root),
+        domain=domain,
+        query=applied_query,
+        limit=limit,
+        fields=fields,
+        detailed=detailed,
     )
 
 @mcp.resource("hass://entities")
@@ -359,7 +647,7 @@ async def get_all_entities_resource() -> str:
 
 @mcp.tool()
 @async_handler("search_entities_tool")
-async def search_entities_tool(query: str, limit: int = 20) -> Dict[str, Any]:
+async def search_entities_tool(query: str, limit: int = 20) -> SearchEntitiesResponse:
     """
     Search for entities matching a query string
     
@@ -391,10 +679,18 @@ async def search_entities_tool(query: str, limit: int = 20) -> Dict[str, Any]:
     if not query or not query.strip():
         logger.info(f"Empty query - retrieving up to {limit} entities without filtering")
         entities = await get_entities(limit=limit, lean=True)
-        
-        # Check if there was an error
-        if isinstance(entities, dict) and "error" in entities:
-            return {"error": entities["error"], "count": 0, "results": [], "domains": {}}
+
+        error = _extract_error_message(entities)
+        if error:
+            return SearchEntitiesResponse(
+                success=False,
+                error=error,
+                result=HassEntityList(root=[]),
+                count=0,
+                limit=limit,
+                query="",
+                domains={},
+            )
         
         # No query, but we'll return a structured result anyway
         domains_count = {}
@@ -432,19 +728,29 @@ async def search_entities_tool(query: str, limit: int = 20) -> Dict[str, Any]:
             simplified_entities.append(simplified_entity)
         
         # Return structured response for empty query
-        return {
-            "count": len(simplified_entities),
-            "results": simplified_entities,
-            "domains": domains_count,
-            "query": "all entities (no filtering)"
-        }
+        entity_list = _to_entity_list(simplified_entities)
+        return SearchEntitiesResponse(
+            result=entity_list,
+            count=len(entity_list.root),
+            limit=limit,
+            query="all entities (no filtering)",
+            domains=domains_count,
+        )
     
     # Normal search with non-empty query
     entities = await get_entities(search_query=query, limit=limit, lean=True)
     
-    # Check if there was an error
-    if isinstance(entities, dict) and "error" in entities:
-        return {"error": entities["error"], "count": 0, "results": [], "domains": {}}
+    error = _extract_error_message(entities)
+    if error:
+        return SearchEntitiesResponse(
+            success=False,
+            error=error,
+            result=HassEntityList(root=[]),
+            count=0,
+            limit=limit,
+            query=query,
+            domains={},
+        )
     
     # Prepare the results
     domains_count = {}
@@ -481,13 +787,14 @@ async def search_entities_tool(query: str, limit: int = 20) -> Dict[str, Any]:
         
         simplified_entities.append(simplified_entity)
     
-    # Return structured response
-    return {
-        "count": len(simplified_entities),
-        "results": simplified_entities,
-        "domains": domains_count,
-        "query": query
-    }
+    entity_list = _to_entity_list(simplified_entities)
+    return SearchEntitiesResponse(
+        result=entity_list,
+        count=len(entity_list.root),
+        limit=limit,
+        query=query,
+        domains=domains_count,
+    )
     
 @mcp.resource("hass://search/{query}/{limit}")
 @async_handler("search_entities_resource_with_limit")
@@ -607,7 +914,7 @@ async def search_entities_resource_with_limit(query: str, limit: str) -> str:
 
 @mcp.tool()
 @async_handler("domain_summary")
-async def domain_summary_tool(domain: str, example_limit: int = 3) -> Dict[str, Any]:
+async def domain_summary_tool(domain: str, example_limit: int = 3) -> DomainSummaryResponse:
     """
     Get a summary of entities in a specific domain
     
@@ -628,11 +935,36 @@ async def domain_summary_tool(domain: str, example_limit: int = 3) -> Dict[str, 
     Best Practices:
         - Use this before retrieving all entities in a domain to understand what's available    """
     logger.info(f"Getting domain summary for: {domain}")
-    return await summarize_domain(domain, example_limit)
+    summary = await summarize_domain(domain, example_limit)
+    error = _extract_error_message(summary)
+    if error:
+        return DomainSummaryResponse(success=False, error=error, result=None)
+
+    examples: Dict[str, List[DomainStateExample]] = {}
+    for state, items in summary.get("examples", {}).items():
+        examples[state] = [DomainStateExample.model_validate(item) for item in items]
+
+    common_attributes_raw = summary.get("common_attributes", [])
+    common_attributes: List[AttributeFrequency] = []
+    for item in common_attributes_raw:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            common_attributes.append(AttributeFrequency(name=str(item[0]), count=int(item[1])))
+        elif isinstance(item, dict):
+            common_attributes.append(AttributeFrequency(**item))
+
+    data = DomainSummaryData(
+        domain=summary.get("domain", domain),
+        total_count=summary.get("total_count", 0),
+        state_distribution=summary.get("state_distribution", {}),
+        examples=examples,
+        common_attributes=common_attributes,
+    )
+
+    return DomainSummaryResponse(result=data)
 
 @mcp.tool()
 @async_handler("system_overview")
-async def system_overview() -> Dict[str, Any]:
+async def system_overview() -> SystemOverviewResponse:
     """
     Get a comprehensive overview of the entire Home Assistant system
     
@@ -652,7 +984,39 @@ async def system_overview() -> Dict[str, Any]:
         - After getting an overview, use domain_summary_tool to dig deeper into specific domains
     """
     logger.info("Generating complete system overview")
-    return await get_system_overview()
+    overview = await get_system_overview()
+    error = _extract_error_message(overview)
+    if error:
+        return SystemOverviewResponse(success=False, error=error, result=None)
+
+    domains = {
+        name: DomainOverviewInfo.model_validate(info)
+        for name, info in overview.get("domains", {}).items()
+    }
+
+    domain_samples = {
+        name: [DomainSample.model_validate(sample) for sample in samples]
+        for name, samples in overview.get("domain_samples", {}).items()
+    }
+
+    most_common_domains = []
+    for item in overview.get("most_common_domains", []):
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            most_common_domains.append(DomainCount(domain=str(item[0]), count=int(item[1])))
+        elif isinstance(item, dict):
+            most_common_domains.append(DomainCount(**item))
+
+    data = SystemOverviewData(
+        total_entities=overview.get("total_entities", 0),
+        domain_count=overview.get("domain_count"),
+        domains=domains,
+        domain_samples=domain_samples,
+        domain_attributes=overview.get("domain_attributes", {}),
+        area_distribution=overview.get("area_distribution", {}),
+        most_common_domains=most_common_domains,
+    )
+
+    return SystemOverviewResponse(result=data)
 
 @mcp.resource("hass://entities/{entity_id}/detailed")
 @async_handler("get_entity_resource_detailed")
@@ -826,7 +1190,7 @@ async def list_states_by_domain_resource(domain: str) -> str:
 # Automation management MCP tools
 @mcp.tool()
 @async_handler("list_automations")
-async def list_automations() -> List[Dict[str, Any]]:
+async def list_automations() -> AutomationsResponse:
     """
     Get a list of all automations from Home Assistant
     
@@ -843,29 +1207,26 @@ async def list_automations() -> List[Dict[str, Any]]:
     """
     logger.info("Getting all automations")
     try:
-        # Get automations will now return data from states API, which is more reliable
         automations = await get_automations()
-        
-        # Handle error responses that might still occur
-        if isinstance(automations, dict) and "error" in automations:
-            logger.warning(f"Error getting automations: {automations['error']}")
-            return []
-            
-        # Handle case where response is a list with error
-        if isinstance(automations, list) and len(automations) == 1 and isinstance(automations[0], dict) and "error" in automations[0]:
-            logger.warning(f"Error getting automations: {automations[0]['error']}")
-            return []
-            
-        return automations
+        error = _extract_error_message(automations)
+        if error:
+            logger.warning(f"Error getting automations: {error}")
+            return AutomationsResponse(success=False, error=error, result=[], count=0)
+
+        if not isinstance(automations, list):
+            automations = []
+
+        automation_models = [AutomationModel.model_validate(item) for item in automations]
+        return AutomationsResponse(result=automation_models, count=len(automation_models))
     except Exception as e:
         logger.error(f"Error in list_automations: {str(e)}")
-        return []
+        return AutomationsResponse(success=False, error=str(e), result=[], count=0)
 
 # We already have a list_automations tool, so no need to duplicate functionality
 
 @mcp.tool()
 @async_handler("restart_ha")
-async def restart_ha() -> Dict[str, Any]:
+async def restart_ha() -> ServiceCallResponse:
     """
     Restart Home Assistant
     
@@ -875,11 +1236,24 @@ async def restart_ha() -> Dict[str, Any]:
         Result of restart operation
     """
     logger.info("Restarting Home Assistant")
-    return await restart_home_assistant()
+    result = await restart_home_assistant()
+    error = _extract_error_message(result)
+
+    return ServiceCallResponse(
+        result=result if not error else None,
+        success=error is None,
+        error=error,
+        domain="homeassistant",
+        service="restart",
+    )
 
 @mcp.tool()
 @async_handler("call_service")
-async def call_service_tool(domain: str, service: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+async def call_service_tool(
+    domain: str,
+    service: str,
+    data: Optional[Dict[str, Any]] = None,
+) -> ServiceCallResponse:
     """
     Call any Home Assistant service (low-level API access)
     
@@ -898,7 +1272,18 @@ async def call_service_tool(domain: str, service: str, data: Optional[Dict[str, 
     
     """
     logger.info(f"Calling Home Assistant service: {domain}.{service} with data: {data}")
-    return await call_service(domain, service, data or {})
+    payload = data or {}
+    result = await call_service(domain, service, payload)
+    error = _extract_error_message(result)
+
+    return ServiceCallResponse(
+        result=result if not error else None,
+        success=error is None,
+        error=error,
+        domain=domain,
+        service=service,
+        data=payload,
+    )
 
 # Prompt functionality
 @mcp.prompt()
@@ -1123,7 +1508,7 @@ You'll help the user create optimized dashboards by:
 # Documentation endpoint
 @mcp.tool()
 @async_handler("get_history")
-async def get_history(entity_id: str, hours: int = 24) -> Dict[str, Any]:
+async def get_history(entity_id: str, hours: int = 24) -> HistoryResponse:
     """
     Get the history of an entity's state changes
     
@@ -1152,15 +1537,15 @@ async def get_history(entity_id: str, hours: int = 24) -> Dict[str, Any]:
     try:
         # Call the new hass function to get history
         history_data = await get_entity_history(entity_id, hours)
-        
-        # Check for errors from the API call
-        if isinstance(history_data, dict) and "error" in history_data:
-            return {
-                "entity_id": entity_id,
-                "error": history_data["error"],
-                "states": [],
-                "count": 0
-            }
+        error = _extract_error_message(history_data)
+        if error:
+            return HistoryResponse(
+                success=False,
+                error=error,
+                result=[],
+                entity_id=entity_id,
+                count=0,
+            )
         
         # The result from the API is a list of lists of state changes
         # We need to flatten it and process it
@@ -1170,41 +1555,44 @@ async def get_history(entity_id: str, hours: int = 24) -> Dict[str, Any]:
                 states.extend(state_list)
         
         if not states:
-            return {
-                "entity_id": entity_id,
-                "states": [],
-                "count": 0,
-                "first_changed": None,
-                "last_changed": None,
-                "note": "No state changes found in the specified timeframe."
-            }
-        
+            return HistoryResponse(
+                result=[],
+                entity_id=entity_id,
+                count=0,
+                first_changed=None,
+                last_changed=None,
+                note="No state changes found in the specified timeframe.",
+            )
+
         # Sort states by last_changed timestamp
         states.sort(key=lambda x: x.get("last_changed", ""))
-        
-        # Extract first and last changed timestamps
-        first_changed = states[0].get("last_changed")
-        last_changed = states[-1].get("last_changed")
-        
-        return {
-            "entity_id": entity_id,
-            "states": states,
-            "count": len(states),
-            "first_changed": first_changed,
-            "last_changed": last_changed
-        }
+
+        models = [StateChangeModel.model_validate(state) for state in states]
+
+        # Extract first and last changed timestamps from models
+        first_changed = models[0].last_changed or models[0].last_updated
+        last_changed = models[-1].last_changed or models[-1].last_updated
+
+        return HistoryResponse(
+            result=models,
+            entity_id=entity_id,
+            count=len(models),
+            first_changed=first_changed,
+            last_changed=last_changed,
+        )
     except Exception as e:
         logger.error(f"Error processing history for {entity_id}: {str(e)}")
-        return {
-            "entity_id": entity_id,
-            "error": f"Error processing history: {str(e)}",
-            "states": [],
-            "count": 0
-        }
+        return HistoryResponse(
+            success=False,
+            error=f"Error processing history: {str(e)}",
+            result=[],
+            entity_id=entity_id,
+            count=0,
+        )
 
 @mcp.tool()
 @async_handler("get_error_log")
-async def get_error_log() -> Dict[str, Any]:
+async def get_error_log() -> ErrorLogResponse:
     """
     Get the Home Assistant error log for troubleshooting
     
@@ -1225,4 +1613,12 @@ async def get_error_log() -> Dict[str, Any]:
         - Focus on integrations with many mentions in the log    
     """
     logger.info("Getting Home Assistant error log")
-    return await get_hass_error_log()
+    summary = await get_hass_error_log()
+    error = _extract_error_message(summary)
+    data = ErrorLogData.model_validate(summary if isinstance(summary, dict) else {})
+
+    return ErrorLogResponse(
+        result=data,
+        success=error is None,
+        error=error,
+    )
